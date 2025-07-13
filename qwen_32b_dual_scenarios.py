@@ -1,0 +1,292 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import json
+import gc
+import os
+from datetime import datetime
+
+# Set environment variables for memory optimization
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+def cleanup_memory():
+    """Aggressive memory cleanup"""
+    print("🧹 Aggressive memory cleanup...")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+    
+    # Force garbage collection multiple times
+    for _ in range(3):
+        gc.collect()
+    
+    if torch.cuda.is_available():
+        print(f"🔍 Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3 - torch.cuda.memory_allocated() / 1024**3:.1f}GB")
+
+def load_qwen_32b():
+    """Load Qwen 32B with optimized settings for A100 80GB"""
+    print("🚀 Loading Qwen 32B with 4-bit quantization...")
+    
+    # 4-bit quantization config - very conservative for reliability
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
+    
+    model_name = "Qwen/Qwen2.5-32B-Instruct"
+    
+    try:
+        print("📝 Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        
+        print("🔧 Loading model with 4-bit quantization...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quantization_config,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            attn_implementation="flash_attention_2"  # More memory efficient
+        )
+        
+        print(f"✅ Qwen 32B loaded successfully!")
+        if torch.cuda.is_available():
+            print(f"📊 GPU memory used: {torch.cuda.memory_allocated() / 1024**3:.1f}GB")
+        
+        return model, tokenizer
+    except Exception as e:
+        print(f"❌ Failed to load model with flash attention, trying without...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+            print(f"✅ Qwen 32B loaded successfully (without flash attention)!")
+            if torch.cuda.is_available():
+                print(f"📊 GPU memory used: {torch.cuda.memory_allocated() / 1024**3:.1f}GB")
+            return model, tokenizer
+        except Exception as e2:
+            print(f"❌ Failed to load model: {e2}")
+            return None, None
+
+def load_game_data():
+    """Load and optimize game data"""
+    with open('data.json', 'r') as f:
+        data = json.load(f)
+    return data
+
+def load_prompt_file(filename):
+    """Load prompt file with fallback options"""
+    possible_files = [
+        filename,
+        f"prompt_{filename.replace('prompt_', '').replace('.txt', '')}.txt",
+        f"prompt_{filename.replace('prompt_', '').replace('.txt', '')}_reflection.txt",
+        f"prompt_basicreflection.txt",
+        f"prompt_noreflection.txt"
+    ]
+    
+    for file_path in possible_files:
+        try:
+            with open(file_path, 'r') as f:
+                return f.read()
+        except FileNotFoundError:
+            continue
+    
+    # If no file found, return a basic prompt
+    return """You are a seasoned sports journalist. Write a professional NBA game report that captures the energy, key moments, and standout performances. Base your report strictly on the provided JSON data. The report should be between 350-450 words, written as a single paragraph."""
+
+def create_sports_prompt(game_data, prompt_type="reflection"):
+    """Create optimized prompt for sports journalism"""
+    # Try to load the appropriate prompt file
+    if prompt_type == "reflection":
+        possible_files = [
+            "prompt_with_reflection.txt",
+            "prompt_basicreflection.txt",
+            "prompt_reflection.txt"
+        ]
+    else:
+        possible_files = [
+            "prompt_with_no_reflection.txt", 
+            "prompt_noreflection.txt",
+            "prompt_no_reflection.txt"
+        ]
+    
+    base_prompt = None
+    for filename in possible_files:
+        try:
+            with open(filename, 'r') as f:
+                base_prompt = f.read()
+                print(f"📄 Using prompt file: {filename}")
+                break
+        except FileNotFoundError:
+            continue
+    
+    if base_prompt is None:
+        # Fallback prompt
+        if prompt_type == "reflection":
+            base_prompt = """You are a seasoned sports journalist. Write a professional NBA game report that captures the energy, key moments, and standout performances. 
+
+Before finalizing your report, internally review whether your output fully complies with all instructions and factual requirements. Double-check every statistic against the provided JSON data. Ensure your word count is between 350-450 words.
+
+Base your report strictly on the provided JSON data. The report should be between 350-450 words, written as a single paragraph."""
+        else:
+            base_prompt = """You are a seasoned sports journalist. Write a professional NBA game report that captures the energy, key moments, and standout performances. Base your report strictly on the provided JSON data. The report should be between 350-450 words, written as a single paragraph."""
+    
+    # Convert game data to condensed format
+    game_info = game_data.get('game_info', {})
+    teams = game_data.get('teams', {})
+    
+    # Extract key information
+    condensed_data = {
+        'game_info': {
+            'date': game_info.get('date'),
+            'venue': game_info.get('venue'),
+            'final_score': game_info.get('final_score')
+        },
+        'teams': {}
+    }
+    
+    # Process team data
+    for team_name, team_data in teams.items():
+        condensed_data['teams'][team_name] = {
+            'record': team_data.get('record'),
+            'stats': team_data.get('team_stats', {}),
+            'quarters': team_data.get('quarters', []),
+            'top_players': {}
+        }
+        
+        # Get top 4 players by points (32B can handle more detail)
+        players = team_data.get('players', {})
+        sorted_players = sorted(players.items(), key=lambda x: x[1].get('pts', 0), reverse=True)[:4]
+        
+        for player_name, player_stats in sorted_players:
+            condensed_data['teams'][team_name]['top_players'][player_name] = {
+                'pts': player_stats.get('pts', 0),
+                'reb': player_stats.get('reb', 0),
+                'ast': player_stats.get('ast', 0),
+                'stl': player_stats.get('stl', 0),
+                'blk': player_stats.get('blk', 0),
+                'fgm': player_stats.get('fgm', 0),
+                'fga': player_stats.get('fga', 0),
+                'fg3m': player_stats.get('fg3m', 0),
+                'fg3a': player_stats.get('fg3a', 0),
+                'starter': player_stats.get('starter', False)
+            }
+    
+    # Create the final prompt
+    prompt = f"""{base_prompt}
+
+# Game Data (JSON):
+{json.dumps(condensed_data, indent=2)}
+
+# Task:
+Write a professional NBA game report following ALL instructions above. The report must be between 350-450 words, written as a single paragraph, and based strictly on the provided JSON data. Generate ONLY the final report - no explanations, no analysis, just the complete game report."""
+
+    return prompt
+
+def generate_report(model, tokenizer, prompt, scenario_name):
+    """Generate sports report with Qwen 32B"""
+    print(f"🏀 Generating sports report with Qwen 32B ({scenario_name})...")
+    
+    # Create chat format for Qwen
+    messages = [
+        {"role": "system", "content": "You are a professional NBA sports journalist. Write accurate, engaging game reports based on provided data. Follow the instructions exactly and generate only the final report."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    # Apply chat template
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    
+    # Tokenize
+    inputs = tokenizer(formatted_prompt, return_tensors="pt", truncation=True, max_length=8000)
+    input_ids = inputs["input_ids"].to(model.device)
+    
+    print(f"📊 Input tokens: {len(input_ids[0])}")
+    print(f"📊 Memory before generation: {torch.cuda.memory_allocated() / 1024**3:.1f}GB")
+    
+    # Generation parameters optimized for Qwen 32B
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            max_new_tokens=600,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            no_repeat_ngram_size=3,
+            pad_token_id=tokenizer.eos_token_id,
+            use_cache=False  # Save memory
+        )
+    
+    # Decode response
+    response = tokenizer.decode(outputs[0][len(input_ids[0]):], skip_special_tokens=True)
+    return response.strip()
+
+def main():
+    """Main execution function"""
+    print("=" * 80)
+    print("🏀 QWEN 32B SPORTS JOURNALISM GENERATOR - DUAL SCENARIOS")
+    print("=" * 80)
+    
+    # Memory cleanup
+    cleanup_memory()
+    
+    # Load model
+    model, tokenizer = load_qwen_32b()
+    if model is None:
+        print("❌ Failed to load model. Exiting.")
+        return
+    
+    # Load game data
+    print("📊 Loading game data...")
+    game_data = load_game_data()
+    
+    scenarios = [
+        ("WITH REFLECTION", "reflection"),
+        ("WITHOUT REFLECTION", "no_reflection")
+    ]
+    
+    for scenario_name, scenario_type in scenarios:
+        print(f"\n{'='*80}")
+        print(f"🏀 SCENARIO: {scenario_name}")
+        print(f"{'='*80}")
+        
+        # Create prompt
+        print(f"📝 Creating {scenario_type} prompt...")
+        prompt = create_sports_prompt(game_data, scenario_type)
+        
+        # Generate report
+        report = generate_report(model, tokenizer, prompt, scenario_name)
+        
+        # Display results
+        print(f"\n🏀 GENERATED SPORTS REPORT ({scenario_name})")
+        print("=" * 80)
+        print(report)
+        print("=" * 80)
+        
+        # Word count
+        word_count = len(report.split())
+        print(f"📊 Word count: {word_count}")
+        print(f"📊 Target range: 350-450 words")
+        
+        if 350 <= word_count <= 450:
+            print("✅ Word count within target range!")
+        else:
+            print("⚠️ Word count outside target range")
+        
+        # Memory cleanup between scenarios
+        cleanup_memory()
+
+if __name__ == "__main__":
+    main() 
